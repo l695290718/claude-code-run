@@ -1,6 +1,6 @@
 import * as React from 'react';
 import { clearTrustedDeviceTokenCache } from '../../bridge/trustedDevice.js';
-import { Text } from '../../ink.js';
+import { Text } from '@anthropic/ink';
 import { refreshGrowthBookAfterAuthChange } from '../../services/analytics/growthbook.js';
 import { getGroveNoticeConfig, getGroveSettings } from '../../services/api/grove.js';
 import { clearPolicyLimitsCache } from '../../services/policyLimits/index.js';
@@ -13,24 +13,21 @@ import { gracefulShutdownSync } from '../../utils/gracefulShutdown.js';
 import { getSecureStorage } from '../../utils/secureStorage/index.js';
 import { clearToolSchemaCache } from '../../utils/toolSchemaCache.js';
 import { resetUserCache } from '../../utils/user.js';
-export async function performLogout({
-  clearOnboarding = false
-}): Promise<void> {
+
+export async function performLogout({ clearOnboarding = false }): Promise<void> {
   // Flush telemetry BEFORE clearing credentials to prevent org data leakage
-  const {
-    flushTelemetry
-  } = await import('../../utils/telemetry/instrumentation.js');
+  const { flushTelemetry } = await import('../../utils/telemetry/instrumentation.js');
   await flushTelemetry();
+
   await removeApiKey();
 
   // Wipe all secure storage data on logout
   const secureStorage = getSecureStorage();
   secureStorage.delete();
+
   await clearAuthRelatedCaches();
   saveGlobalConfig(current => {
-    const updated = {
-      ...current
-    };
+    const updated = { ...current };
     if (clearOnboarding) {
       updated.hasCompletedOnboarding = false;
       updated.subscriptionNoticeCount = 0;
@@ -38,7 +35,7 @@ export async function performLogout({
       if (updated.customApiKeyResponses?.approved) {
         updated.customApiKeyResponses = {
           ...updated.customApiKeyResponses,
-          approved: []
+          approved: [],
         };
       }
     }
@@ -69,13 +66,15 @@ export async function clearAuthRelatedCaches(): Promise<void> {
   // Clear policy limits cache
   await clearPolicyLimitsCache();
 }
+
 export async function call(): Promise<React.ReactNode> {
-  await performLogout({
-    clearOnboarding: true
-  });
+  await performLogout({ clearOnboarding: true });
+
   const message = <Text>Successfully logged out from your Anthropic account.</Text>;
+
   setTimeout(() => {
     gracefulShutdownSync(0, 'logout');
   }, 200);
+
   return message;
 }

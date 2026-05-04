@@ -50,10 +50,13 @@ import {
   type ToolCallProgress,
   toolMatchesName,
 } from '../../Tool.js'
-import { ListMcpResourcesTool } from '../../tools/ListMcpResourcesTool/ListMcpResourcesTool.js'
-import { type MCPProgress, MCPTool } from '../../tools/MCPTool/MCPTool.js'
-import { createMcpAuthTool } from '../../tools/McpAuthTool/McpAuthTool.js'
-import { ReadMcpResourceTool } from '../../tools/ReadMcpResourceTool/ReadMcpResourceTool.js'
+import { ListMcpResourcesTool } from '@claude-code-best/builtin-tools/tools/ListMcpResourcesTool/ListMcpResourcesTool.js'
+import {
+  type MCPProgress,
+  MCPTool,
+} from '@claude-code-best/builtin-tools/tools/MCPTool/MCPTool.js'
+import { createMcpAuthTool } from '@claude-code-best/builtin-tools/tools/McpAuthTool/McpAuthTool.js'
+import { ReadMcpResourceTool } from '@claude-code-best/builtin-tools/tools/ReadMcpResourceTool/ReadMcpResourceTool.js'
 import { createAbortController } from '../../utils/abortController.js'
 import { count } from '../../utils/array.js'
 import {
@@ -93,7 +96,6 @@ import {
   getWebSocketProxyAgent,
   getWebSocketProxyUrl,
 } from '../../utils/proxy.js'
-import { recursivelySanitizeUnicode } from '../../utils/sanitization.js'
 import { getSessionIngressAuthToken } from '../../utils/sessionIngressAuth.js'
 import { subprocessEnv } from '../../utils/subprocessEnv.js'
 import {
@@ -113,6 +115,19 @@ import { buildMcpToolName } from './mcpStringUtils.js'
 import { normalizeNameForMCP } from './normalization.js'
 import { getLoggingSafeMcpBaseUrl } from './utils.js'
 
+// Package imports — delegate to mcp-client package utilities where applicable
+import {
+  createMcpClient as createMcpClientFromPackage,
+  captureStderr,
+  isMcpSessionExpiredError as isMcpSessionExpiredErrorFromPackage,
+  installConnectionMonitor,
+  createCleanup as createCleanupFromPackage,
+  buildConnectedServer,
+  DEFAULT_CONNECTION_TIMEOUT_MS,
+  MAX_MCP_DESCRIPTION_LENGTH as PKG_MAX_MCP_DESCRIPTION_LENGTH,
+} from '@claude-code-best/mcp-client'
+import { recursivelySanitizeUnicode } from '@claude-code-best/mcp-client'
+
 /* eslint-disable @typescript-eslint/no-require-imports */
 const fetchMcpSkillsForClient = feature('MCP_SKILLS')
   ? (
@@ -123,7 +138,7 @@ const fetchMcpSkillsForClient = feature('MCP_SKILLS')
 import { UnauthorizedError } from '@modelcontextprotocol/sdk/client/auth.js'
 import type { AssistantMessage } from 'src/types/message.js'
 /* eslint-enable @typescript-eslint/no-require-imports */
-import { classifyMcpToolForCollapse } from '../../tools/MCPTool/classifyForCollapse.js'
+import { classifyMcpToolForCollapse } from '@claude-code-best/builtin-tools/tools/MCPTool/classifyForCollapse.js'
 import { clearKeychainCache } from '../../utils/secureStorage/macOsKeychainHelpers.js'
 import { sleep } from '../../utils/sleep.js'
 import {
@@ -191,20 +206,7 @@ export class McpToolCallError_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS extends T
  * Per the MCP spec, servers return 404 when a session ID is no longer valid.
  * We check both signals to avoid false positives from generic 404s (wrong URL, server gone, etc.).
  */
-export function isMcpSessionExpiredError(error: Error): boolean {
-  const httpStatus =
-    'code' in error ? (error as Error & { code?: number }).code : undefined
-  if (httpStatus !== 404) {
-    return false
-  }
-  // The SDK embeds the response body text in the error message.
-  // MCP servers return: {"error":{"code":-32001,"message":"Session not found"},...}
-  // Check for the JSON-RPC error code to distinguish from generic web server 404s.
-  return (
-    error.message.includes('"code":-32001') ||
-    error.message.includes('"code": -32001')
-  )
-}
+export const isMcpSessionExpiredError = isMcpSessionExpiredErrorFromPackage
 
 /**
  * Default timeout for MCP tool calls (effectively infinite - ~27.8 hours).
@@ -216,7 +218,7 @@ const DEFAULT_MCP_TOOL_TIMEOUT_MS = 100_000_000
  * OpenAPI-generated MCP servers have been observed dumping 15-60KB of endpoint
  * docs into tool.description; this caps the p95 tail without losing the intent.
  */
-const MAX_MCP_DESCRIPTION_LENGTH = 2048
+const MAX_MCP_DESCRIPTION_LENGTH = PKG_MAX_MCP_DESCRIPTION_LENGTH
 
 /**
  * Gets the timeout for MCP tool calls in milliseconds.
@@ -904,7 +906,8 @@ export const connectToServer = memoize(
         )
         logMCPDebug(name, `claude.ai proxy transport created successfully`)
       } else if (
-        ((serverRef as ScopedMcpServerConfig).type === 'stdio' || !(serverRef as ScopedMcpServerConfig).type) &&
+        ((serverRef as ScopedMcpServerConfig).type === 'stdio' ||
+          !(serverRef as ScopedMcpServerConfig).type) &&
         isClaudeInChromeMCPServer(name)
       ) {
         // Run the Chrome MCP server in-process to avoid spawning a ~325 MB subprocess
@@ -917,7 +920,9 @@ export const connectToServer = memoize(
         const { createLinkedTransportPair } = await import(
           './InProcessTransport.js'
         )
-        const context = createChromeContext((serverRef as McpStdioServerConfig).env)
+        const context = createChromeContext(
+          (serverRef as McpStdioServerConfig).env,
+        )
         inProcessServer = createClaudeForChromeMcpServer(context)
         const [clientTransport, serverTransport] = createLinkedTransportPair()
         await inProcessServer.connect(serverTransport)
@@ -925,7 +930,8 @@ export const connectToServer = memoize(
         logMCPDebug(name, `In-process Chrome MCP server started`)
       } else if (
         feature('CHICAGO_MCP') &&
-        ((serverRef as ScopedMcpServerConfig).type === 'stdio' || !(serverRef as ScopedMcpServerConfig).type) &&
+        ((serverRef as ScopedMcpServerConfig).type === 'stdio' ||
+          !(serverRef as ScopedMcpServerConfig).type) &&
         isComputerUseMCPServer!(name)
       ) {
         // Run the Computer Use MCP server in-process — same rationale as
@@ -942,7 +948,10 @@ export const connectToServer = memoize(
         await inProcessServer.connect(serverTransport)
         transport = clientTransport
         logMCPDebug(name, `In-process Computer Use MCP server started`)
-      } else if ((serverRef as ScopedMcpServerConfig).type === 'stdio' || !(serverRef as ScopedMcpServerConfig).type) {
+      } else if (
+        (serverRef as ScopedMcpServerConfig).type === 'stdio' ||
+        !(serverRef as ScopedMcpServerConfig).type
+      ) {
         const stdioRef = serverRef as McpStdioServerConfig
         const finalCommand =
           process.env.CLAUDE_CODE_SHELL_PREFIX || stdioRef.command
@@ -959,7 +968,9 @@ export const connectToServer = memoize(
           stderr: 'pipe', // prevents error output from the MCP server from printing to the UI
         })
       } else {
-        throw new Error(`Unsupported server type: ${(serverRef as ScopedMcpServerConfig).type}`)
+        throw new Error(
+          `Unsupported server type: ${(serverRef as ScopedMcpServerConfig).type}`,
+        )
       }
 
       // Set up stderr logging for stdio transport before connecting in case there are any stderr
@@ -1445,6 +1456,7 @@ export const connectToServer = memoize(
               }
 
               // Wait for graceful shutdown with rapid escalation (total 500ms to keep CLI responsive)
+              // biome-ignore lint/suspicious/noAsyncPromiseExecutor: async needed for sequential await inside executor
               await new Promise<void>(async resolve => {
                 let resolved = false
 
@@ -3247,8 +3259,14 @@ async function callMCPTool({
 }
 
 function extractToolUseId(message: AssistantMessage): string | undefined {
-  const firstBlock = (message.message.content as ContentBlockParam[] | undefined)?.[0]
-  if (!firstBlock || typeof firstBlock === 'string' || firstBlock.type !== 'tool_use') {
+  const firstBlock = (
+    message.message.content as ContentBlockParam[] | undefined
+  )?.[0]
+  if (
+    !firstBlock ||
+    typeof firstBlock === 'string' ||
+    firstBlock.type !== 'tool_use'
+  ) {
     return undefined
   }
   return firstBlock.id
