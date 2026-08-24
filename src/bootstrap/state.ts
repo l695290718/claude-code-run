@@ -8,7 +8,7 @@ import { realpathSync } from 'fs'
 import sumBy from 'lodash-es/sumBy.js'
 import { cwd } from 'process'
 import type { HookEvent, ModelUsage } from 'src/entrypoints/agentSdkTypes.js'
-import type { AgentColorName } from 'src/tools/AgentTool/agentColorManager.js'
+import type { AgentColorName } from '@claude-code-best/builtin-tools/tools/AgentTool/agentColorManager.js'
 import type { HookCallbackMatcher } from 'src/types/hooks.js'
 // Indirection for browser-sdk build (package.json "browser" field swaps
 // crypto.ts for crypto.browser.ts). Pure leaf re-export of node:crypto —
@@ -235,11 +235,6 @@ type State = {
   // microcompact is first enabled, keep sending the header so mid-session
   // GrowthBook/settings toggles don't bust the prompt cache.
   cacheEditingHeaderLatched: boolean | null
-  // Sticky-on latch for clearing thinking from prior tool loops. Triggered
-  // when >1h since last API call (confirmed cache miss — no cache-hit
-  // benefit to keeping thinking). Once latched, stays on so the newly-warmed
-  // thinking-cleared cache isn't busted by flipping back to keep:'all'.
-  thinkingClearLatched: boolean | null
   // Current prompt ID (UUID) correlating a user prompt with subsequent OTel events
   promptId: string | null
   // Last API requestId for the main conversation chain (not subagents).
@@ -414,7 +409,6 @@ function getInitialState(): State {
     afkModeHeaderLatched: null,
     fastModeHeaderLatched: null,
     cacheEditingHeaderLatched: null,
-    thinkingClearLatched: null,
     // Current prompt ID
     promptId: null,
     lastMainRequestId: undefined,
@@ -793,18 +787,6 @@ let scrollDraining = false
 let scrollDrainTimer: ReturnType<typeof setTimeout> | undefined
 const SCROLL_DRAIN_IDLE_MS = 150
 
-/** Mark that a scroll event just happened. Background intervals gate on
- *  getIsScrollDraining() and skip their work until the debounce clears. */
-export function markScrollActivity(): void {
-  scrollDraining = true
-  if (scrollDrainTimer) clearTimeout(scrollDrainTimer)
-  scrollDrainTimer = setTimeout(() => {
-    scrollDraining = false
-    scrollDrainTimer = undefined
-  }, SCROLL_DRAIN_IDLE_MS)
-  scrollDrainTimer.unref?.()
-}
-
 /** True while scroll is actively draining (within 150ms of last event).
  *  Intervals should early-return when this is set — the work picks up next
  *  tick after scroll settles. */
@@ -1107,10 +1089,6 @@ export function getUserMsgOptIn(): boolean {
 
 export function setUserMsgOptIn(value: boolean): void {
   STATE.userMsgOptIn = value
-}
-
-export function getSessionSource(): string | undefined {
-  return STATE.sessionSource
 }
 
 export function setSessionSource(source: string): void {
@@ -1429,7 +1407,7 @@ export function registerHookCallbacks(
     if (!STATE.registeredHooks[eventKey]) {
       STATE.registeredHooks[eventKey] = []
     }
-    STATE.registeredHooks[eventKey]!.push(...matchers)
+    STATE.registeredHooks[eventKey]!.push(...(matchers ?? []))
   }
 }
 
@@ -1437,10 +1415,6 @@ export function getRegisteredHooks(): Partial<
   Record<HookEvent, RegisteredHookMatcher[]>
 > | null {
   return STATE.registeredHooks
-}
-
-export function clearRegisteredHooks(): void {
-  STATE.registeredHooks = null
 }
 
 export function clearRegisteredPluginHooks(): void {
@@ -1451,7 +1425,7 @@ export function clearRegisteredPluginHooks(): void {
   const filtered: Partial<Record<HookEvent, RegisteredHookMatcher[]>> = {}
   for (const [event, matchers] of Object.entries(STATE.registeredHooks)) {
     // Keep only callback hooks (those without pluginRoot)
-    const callbackHooks = matchers.filter(m => !('pluginRoot' in m))
+    const callbackHooks = (matchers ?? []).filter(m => !('pluginRoot' in m))
     if (callbackHooks.length > 0) {
       filtered[event as HookEvent] = callbackHooks
     }
@@ -1467,6 +1441,16 @@ export function resetSdkInitState(): void {
 
 export function getPlanSlugCache(): Map<string, string> {
   return STATE.planSlugCache
+}
+
+export function setPlanSlugCacheEntry(sessionId: string, slug: string): void {
+  if (STATE.planSlugCache.size >= 50) {
+    const firstKey = STATE.planSlugCache.keys().next().value
+    if (firstKey !== undefined) {
+      STATE.planSlugCache.delete(firstKey)
+    }
+  }
+  STATE.planSlugCache.set(sessionId, slug)
 }
 
 export function getSessionCreatedTeams(): Set<string> {
@@ -1521,10 +1505,6 @@ export function addInvokedSkill(
     invokedAt: Date.now(),
     agentId,
   })
-}
-
-export function getInvokedSkills(): Map<string, InvokedSkillInfo> {
-  return STATE.invokedSkills
 }
 
 export function getInvokedSkillsForAgent(
@@ -1646,6 +1626,12 @@ export function setSystemPromptSectionCacheEntry(
   name: string,
   value: string | null,
 ): void {
+  if (STATE.systemPromptSectionCache.size >= 100) {
+    const firstKey = STATE.systemPromptSectionCache.keys().next().value
+    if (firstKey !== undefined) {
+      STATE.systemPromptSectionCache.delete(firstKey)
+    }
+  }
   STATE.systemPromptSectionCache.set(name, value)
 }
 
@@ -1729,14 +1715,6 @@ export function setCacheEditingHeaderLatched(v: boolean): void {
   STATE.cacheEditingHeaderLatched = v
 }
 
-export function getThinkingClearLatched(): boolean | null {
-  return STATE.thinkingClearLatched
-}
-
-export function setThinkingClearLatched(v: boolean): void {
-  STATE.thinkingClearLatched = v
-}
-
 /**
  * Reset beta header latches to null. Called on /clear and /compact so a
  * fresh conversation gets fresh header evaluation.
@@ -1745,7 +1723,6 @@ export function clearBetaHeaderLatches(): void {
   STATE.afkModeHeaderLatched = null
   STATE.fastModeHeaderLatched = null
   STATE.cacheEditingHeaderLatched = null
-  STATE.thinkingClearLatched = null
 }
 
 export function getPromptId(): string | null {
@@ -1755,4 +1732,6 @@ export function getPromptId(): string | null {
 export function setPromptId(id: string | null): void {
   STATE.promptId = id
 }
-export function isReplBridgeActive(): boolean { return false; }
+export function isReplBridgeActive(): boolean {
+  return false
+}
